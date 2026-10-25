@@ -1,5 +1,6 @@
 import http from 'node:http';
 import express from 'express';
+import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { Server } from 'socket.io';
@@ -18,11 +19,20 @@ import { studioMcpRouter } from './agents/studioMcp.js';
 import { startAgents } from './agents/manager.js';
 import { startQueue } from './services/queue.js';
 
+const VERCEL_PREVIEW = /^https:\/\/[a-z0-9][a-z0-9-]*\.vercel\.app$/i;
+export function originAllowed(origin: string | undefined): boolean {
+  if (!origin) return true; // non-browser / same-origin requests carry no Origin
+  return config.corsOrigins.includes(origin) || (config.corsAllowVercelPreviews && VERCEL_PREVIEW.test(origin));
+}
+// Unknown origins just get no CORS headers (the browser blocks them); never an error.
+const corsOrigin = (origin: string | undefined, cb: (err: Error | null, allow?: boolean) => void) => cb(null, originAllowed(origin));
+
 export function createServer() {
   const app = express();
   if (config.trustProxy) app.set('trust proxy', 1);
   app.disable('x-powered-by');
-  app.use(helmet());
+  app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+  app.use(cors({ origin: corsOrigin, credentials: false, methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], allowedHeaders: ['Authorization', 'Content-Type', 'Idempotency-Key'], maxAge: 600 }));
   app.use(express.json({ limit: '1mb' }));
   app.use((req, res, next) => {
     res.on('finish', () => log('info', `${req.method} ${req.path.startsWith('/internal/') ? '/internal/*' : req.path} ${res.statusCode}`)); // path only: no query, headers or body; internal paths carry run tokens
@@ -48,7 +58,7 @@ export function createServer() {
   app.use(errorHandler);
 
   const server = http.createServer(app);
-  const io = new Server(server, { serveClient: false });
+  const io = new Server(server, { serveClient: false, cors: { origin: corsOrigin, credentials: false } });
   attachSockets(io);
 
   let stopQueue = () => {};

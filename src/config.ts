@@ -26,6 +26,9 @@ export const config = {
   jwtSecret: env.JWT_SECRET ?? 'dev-only-secret-change-me-dev-only-secret',
   jwtTtl: env.JWT_TTL ?? '12h',
   logDir: env.LOG_DIR ?? '',
+  // Browser origins allowed to call the API cross-origin (exact match). Empty = same-origin only.
+  corsOrigins: (env.CORS_ORIGINS ?? '').split(',').map((o) => o.trim().replace(/\/+$/, '')).filter(Boolean),
+  corsAllowVercelPreviews: env.CORS_ALLOW_VERCEL_PREVIEWS === '1',
   trustProxy: env.TRUST_PROXY === '1',
   rateMax: Number(env.RATE_LIMIT_MAX ?? 600),
   uploadRateMax: Number(env.UPLOAD_RATE_MAX ?? 20),

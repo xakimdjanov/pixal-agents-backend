@@ -34,6 +34,8 @@ services:
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (openssl rand -hex 32)}
       CONNECTOR_KEY: ${CONNECTOR_KEY:?set CONNECTOR_KEY in .env (openssl rand -hex 32)}
       TRUST_PROXY: "1"
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      CORS_ALLOW_VERCEL_PREVIEWS: ${CORS_ALLOW_VERCEL_PREVIEWS:-}
       LOG_DIR: /var/log/studio
       DATA_DIR: /data
       DEFAULT_FOUNDER_PASSWORD: ${DEFAULT_FOUNDER_PASSWORD:-visitca}
