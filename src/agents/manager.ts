@@ -38,7 +38,7 @@ export async function removeAgent(agentId: string) {
 
 // Every agent with execution_mode 'server' gets a runner; agents created elsewhere (seed, SQL) are picked up here too.
 async function reconcile() {
-  const rows = await q("select id, execution_mode from agents");
+  const rows = await q("select id, execution_mode from agents where deleted_at is null");
   const want = new Set(rows.filter((r) => r.execution_mode === 'server').map((r) => r.id as string));
   for (const id of want) await startAgent(id);
   for (const id of [...runners.keys()]) if (!want.has(id)) stopAgent(id);

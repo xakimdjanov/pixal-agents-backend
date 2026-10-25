@@ -7,4 +7,11 @@ export const agentSelect = `
     case when u.role = 'founder' then (select coalesce(json_agg(p.id), '[]') from projects p)
          else (select coalesce(json_agg(m.project_id), '[]') from project_members m where m.user_id = a.user_id) end as project_ids,
     (select row_to_json(cs) from (select logged_in, auth_method, limit_reached, detail, updated_at from claude_status where agent_id = a.id) cs) as claude
-  from agents a join users u on u.id = a.user_id`;
+  from agents a join users u on u.id = a.user_id and a.deleted_at is null`;
+
+// Removed (soft-deleted) agents, for resolving names on old tasks/messages.
+export const removedAgentSelect = `
+  select a.id, a.name || ' (removed)' as name, a.role, a.user_id, u.name as user_name, 'OFFLINE' as status,
+    a.last_seen_at, null::uuid as current_task_id, a.execution_mode, null as current_activity,
+    '[]'::json as project_ids, null as claude, true as removed, a.deleted_at
+  from agents a join users u on u.id = a.user_id where a.deleted_at is not null`;

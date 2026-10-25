@@ -88,7 +88,7 @@ export async function callTool(actor: Actor, name: string, args: unknown): Promi
     }
     case 'studio_list_agents':
       return q(`select a.id, a.name, a.role, case when a.last_seen_at is null or a.last_seen_at < now() - make_interval(secs => $1) then 'OFFLINE' else a.status end as status
-        from agents a order by a.created_at`, [config.offlineAfterSec]);
+        from agents a where a.deleted_at is null order by a.created_at`, [config.offlineAfterSec]);
     case 'studio_list_tasks': {
       const f = toolInput.studio_list_tasks.parse(args ?? {});
       const params: any[] = [actor.userId, actor.role];

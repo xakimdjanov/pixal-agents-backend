@@ -27,7 +27,7 @@ export const signJwt = (userId: string) => jwt.sign({ sub: userId }, config.jwtS
 export async function resolveActor(token: string): Promise<Actor | null> {
   if (token.startsWith('agt_')) {
     const a = await q1(
-      'select a.id, a.role, a.user_id, u.name from agents a join users u on u.id = a.user_id where a.token_hash = $1',
+      'select a.id, a.role, a.user_id, u.name from agents a join users u on u.id = a.user_id where a.token_hash = $1 and a.deleted_at is null',
       [sha256(token)],
     );
     return a ? { kind: 'agent', userId: a.user_id, name: a.name, role: a.role, agentId: a.id } : null;
@@ -41,7 +41,7 @@ export async function resolveActor(token: string): Promise<Actor | null> {
     return null;
   }
   const u = await q1(
-    'select u.id, u.name, u.role, (select id from agents where user_id = u.id order by created_at limit 1) as agent_id from users u where u.id = $1',
+    'select u.id, u.name, u.role, (select id from agents where user_id = u.id and deleted_at is null order by created_at limit 1) as agent_id from users u where u.id = $1',
     [sub],
   );
   return u ? { kind: 'user', userId: u.id, name: u.name, role: u.role, agentId: u.agent_id } : null;

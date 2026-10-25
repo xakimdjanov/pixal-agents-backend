@@ -31,11 +31,11 @@ export async function founderAgentId(c: PoolClient, task?: any): Promise<string 
          union all
          select t.id, t.parent_task_id, t.sender_agent_id, up.depth + 1 from tasks t join up on t.id = up.parent_task_id where up.depth < 20
        ) select a.id from up join agents a on a.id = up.sender_agent_id
-         where up.parent_task_id is null and a.role = 'founder'`,
+         where up.parent_task_id is null and a.role = 'founder' and a.deleted_at is null`,
       [task.id], c);
     if (root) return root.id;
   }
-  return (await q1(`select id from agents where role = 'founder' order by created_at limit 1`, [], c))?.id ?? null;
+  return (await q1(`select id from agents where role = 'founder' and deleted_at is null order by created_at limit 1`, [], c))?.id ?? null;
 }
 
 // Full TASK_ASSIGNMENT payload (what the runner needs to start work), shared by task creation and manual re-queues.
@@ -159,7 +159,7 @@ export async function createTask(a: Actor, b: CreateTaskInput, key: string | nul
   if (!a.agentId) throw new HttpError(400, 'no agent bound to this user');
   await assertProject(a, b.project_id);
 
-  const assignee = await q1('select id, role, user_id from agents where id = $1', [b.assignee_agent_id]);
+  const assignee = await q1('select id, role, user_id from agents where id = $1 and deleted_at is null', [b.assignee_agent_id]);
   if (!assignee) throw new HttpError(404, 'assignee agent not found');
   const allowed = a.role === 'founder' ? ['pm', 'developer'] : ['developer'];
   if (!allowed.includes(assignee.role)) throw new HttpError(403, `a ${a.role} cannot assign tasks to a ${assignee.role}`);

@@ -46,7 +46,7 @@ export class AgentRunner {
   private tag() { return `[agent ${this.agentId.slice(0, 8)}]`; }
 
   async start() {
-    const a = await q1('select a.id, a.role, a.user_id, u.name from agents a join users u on u.id = a.user_id where a.id = $1', [this.agentId]);
+    const a = await q1('select a.id, a.role, a.user_id, u.name from agents a join users u on u.id = a.user_id where a.id = $1 and a.deleted_at is null', [this.agentId]);
     if (!a) throw new Error('agent not found');
     this.actor = { kind: 'agent', userId: a.user_id, name: a.name, role: a.role, agentId: a.id };
     ensureDirs(this.agentId);
@@ -61,6 +61,11 @@ export class AgentRunner {
     );
     void this.pollInbox();
     log('info', `${this.tag()} runner started (role=${a.role}, mock=${config.mockClaude})`);
+  }
+
+  // Read fresh so a rename takes effect on the next prompt without restarting the runner.
+  private async agentName() {
+    return (await q1('select name from agents where id = $1', [this.agentId]))?.name ?? 'the agent';
   }
 
   async stop() {
@@ -218,7 +223,7 @@ export class AgentRunner {
     try {
       const wt = await prepareWorktree(this.agentId, task.project_id, taskId, p.repo_url ?? '', p.default_branch ?? 'main', await this.loadGitToken(task.project_id));
       const prompt = [
-        `You are the ${this.actor.role} agent on project "${p.project_name ?? task.project_id}". Work only inside this git worktree.`,
+        `You are ${await this.agentName()}, the ${this.actor.role} agent on project "${p.project_name ?? task.project_id}". Work only inside this git worktree.`,
         `Task: ${task.title}`,
         `Description:\n${task.description}`,
         `Acceptance criteria:\n${task.acceptance_criteria}`,
@@ -383,7 +388,7 @@ export class AgentRunner {
     const acct = await this.loadAccountConnectors();
     const studio = studioEligible(this.actor.role);
     const prompt = [
-      `You are the ${this.actor.role} agent, chatting directly with your own user. This is READ-ONLY for files: never modify files, never commit or push.`,
+      `You are ${await this.agentName()}, the ${this.actor.role} agent, chatting directly with your own user. This is READ-ONLY for files: never modify files, never commit or push.`,
       studio ? STUDIO_PROMPT : '',
       `Question: ${question}`,
       this.attachmentPrompt(att.files),

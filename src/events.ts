@@ -56,6 +56,17 @@ export const emitAgent = (agent: any) => {
   io?.to('role:developer').emit('agent:status', forRole(agent, 'developer'));
 };
 
+// Rename etc.: same payload as agent:status plus agent:updated, so lists refresh either way.
+export const emitAgentUpdated = (agent: any) => {
+  emitAgent(agent);
+  io?.to('role:founder').to('role:pm').emit('agent:updated', agent);
+  io?.to('role:developer').emit('agent:updated', forRole(agent, 'developer'));
+};
+
+export const emitAgentRemoved = (id: string) => {
+  io?.to('role:founder').to('role:pm').to('role:developer').emit('agent:removed', { id });
+};
+
 export const emitClaudeStatus = (userId: string, s: { agent_id: string; logged_in: boolean; limit_reached: boolean }) => {
   io?.to(`user:${userId}`).to('founders').emit('claude:status', s);
 };

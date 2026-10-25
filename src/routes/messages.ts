@@ -57,7 +57,7 @@ export async function postMessage(req: any, res: any) {
       : await q('select project_id as id from project_members where user_id = $1', [a.userId])).map((r: any) => r.id);
   }
 
-  const rcpt = await q1('select id, role, user_id from agents where id = $1', [b.recipient_agent_id]);
+  const rcpt = await q1('select id, role, user_id from agents where id = $1 and deleted_at is null', [b.recipient_agent_id]);
   if (!rcpt) throw new HttpError(404, 'recipient not found');
 
   if (b.task_id) {
@@ -100,7 +100,9 @@ messagesRouter.get('/conversations', async (req, res) => {
     `select distinct on (m.conversation_id) m.conversation_id, m.task_id, m.created_at as last_message_at,
             m.type as last_type, m.payload as last_payload,
             (select count(*)::int from messages x where x.conversation_id = m.conversation_id) as message_count
-     from messages m where ${VISIBLE} order by m.conversation_id, m.created_at desc`,
+     from messages m where ${VISIBLE}
+       and (m.task_id is not null or not exists (select 1 from agents ag where ag.deleted_at is not null and ag.id in (m.sender_agent_id, m.recipient_agent_id)))
+     order by m.conversation_id, m.created_at desc`,
     visibleParams(req.actor),
   ));
 });

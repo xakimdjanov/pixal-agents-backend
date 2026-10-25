@@ -89,7 +89,7 @@ projectsRouter.get('/projects/:id/members', async (req, res) => {
   await assertProject(req.actor, req.params.id);
   res.json(await q(
     `select u.id as user_id, u.name, u.email, u.role, a.id as agent_id from project_members m join users u on u.id = m.user_id
-       left join agents a on a.user_id = u.id where m.project_id = $1 order by u.name`,
+       left join agents a on a.user_id = u.id and a.deleted_at is null where m.project_id = $1 order by u.name`,
     [req.params.id],
   ));
 });
@@ -105,7 +105,7 @@ projectsRouter.delete('/projects/:id/members/:userId', requireRole('founder'), a
   if (p.created_by === userId) throw new HttpError(400, 'cannot remove the project creator');
   if (!(await q1('select 1 from project_members where project_id = $1 and user_id = $2', [id, userId]))) throw new HttpError(404, 'member not found');
   const open = await q1(
-    `select count(*)::int as n from tasks t join agents a on a.id = t.assignee_agent_id
+    `select count(*)::int as n from tasks t join agents a on a.id = t.assignee_agent_id and a.deleted_at is null
        where t.project_id = $1 and a.user_id = $2 and t.status = any($3)`,
     [id, userId, ACTIVE_STATUSES],
   );

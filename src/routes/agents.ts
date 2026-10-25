@@ -7,9 +7,9 @@ import { HttpError } from '../errors.js';
 import { audit } from '../services/audit.js';
 import { changeStatus } from '../services/tasks.js';
 import { projectStatus } from '../services/status.js';
-import { emitAgent, emitClaudeLogin, forRole } from '../events.js';
+import { emitAgent, emitAgentRemoved, emitAgentUpdated, emitClaudeLogin, emitTask, forRole } from '../events.js';
 import { agentConnectors } from '../services/connectors.js';
-import { agentSelect } from '../services/agentView.js';
+import { agentSelect, removedAgentSelect } from '../services/agentView.js';
 import { reportClaudeLogin, saveClaudeStatus } from '../services/claudeLogin.js';
 import rateLimit from 'express-rate-limit';
 import { checkClaude, claudeLogout, listAccountConnectors } from '../agents/claude.js';
@@ -24,18 +24,31 @@ agentsRouter.use(authenticate);
 
 agentsRouter.get('/agents', async (req, res) => {
   const rows = await q(`${agentSelect} order by a.created_at`, [config.offlineAfterSec]);
-  res.json(rows.map((r) => forRole(r, req.actor.role)));
+  // ?include_removed=1 appends soft-deleted agents (name "<name> (removed)", removed: true) so old tasks/messages can resolve their names.
+  const removed = ['1', 'true'].includes(String(req.query.include_removed ?? '')) ? await q(`${removedAgentSelect} order by a.created_at`) : [];
+  res.json([...rows, ...removed].map((r) => forRole(r, req.actor.role)));
 });
 
-agentsRouter.patch('/agents/:id', requireRole('founder'), async (req, res) => {
-  const b = z.object({ execution_mode: z.enum(['server', 'worker']) }).parse(req.body);
-  const row = await q1('update agents set execution_mode = $2 where id = $1 returning id', [req.params.id, b.execution_mode]);
-  if (!row) throw new HttpError(404, 'agent not found');
-  await audit(pool, req.actor, 'agent.update', 'agent', row.id, { execution_mode: b.execution_mode });
-  const agent = await q1(`${agentSelect} where a.id = $2`, [config.offlineAfterSec, row.id]);
-  emitAgent(agent);
-  if (b.execution_mode === 'server') await startAgent(row.id); else stopAgent(row.id);
-  res.json(agent);
+agentsRouter.patch('/agents/:id', async (req, res) => {
+  const b = z.object({
+    name: z.string().trim().min(1).max(60).optional(),
+    execution_mode: z.enum(['server', 'worker']).optional(),
+  }).refine((v) => v.name !== undefined || v.execution_mode !== undefined, 'nothing to update').parse(req.body);
+  const agent = await manageableAgent(req);
+  if (req.actor.kind !== 'user') throw new HttpError(403, 'agent tokens cannot use this endpoint');
+  if (b.execution_mode !== undefined && req.actor.role !== 'founder') throw new HttpError(403, 'forbidden');
+  if (b.execution_mode !== undefined) {
+    await q('update agents set execution_mode = $2 where id = $1', [agent.id, b.execution_mode]);
+    await audit(pool, req.actor, 'agent.update', 'agent', agent.id, { execution_mode: b.execution_mode });
+  }
+  if (b.name !== undefined && b.name !== agent.name) {
+    await q('update agents set name = $2 where id = $1', [agent.id, b.name]);
+    await audit(pool, req.actor, 'agent.rename', 'agent', agent.id, { old: agent.name, new: b.name });
+  }
+  const view = await q1(`${agentSelect} where a.id = $2`, [config.offlineAfterSec, agent.id]);
+  emitAgentUpdated(view);
+  if (b.execution_mode === 'server') await startAgent(agent.id); else if (b.execution_mode === 'worker') stopAgent(agent.id);
+  res.json(view);
 });
 
 agentsRouter.post('/agents', requireRole('founder'), async (req, res) => {
@@ -55,26 +68,56 @@ agentsRouter.post('/agents', requireRole('founder'), async (req, res) => {
   res.status(201).json({ agent, token }); // token is shown once (for external workers); only its hash is stored
 });
 
-agentsRouter.delete('/agents/:id', requireRole('founder'), async (req, res) => {
-  const a = await q1('select id from agents where id = $1', [req.params.id]);
-  if (!a) throw new HttpError(404, 'agent not found');
-  stopAgent(a.id);
-  try {
-    await pool.query('delete from agents where id = $1', [a.id]);
-  } catch (e: any) {
-    if (e?.code === '23503') { await startAgent(a.id); throw new HttpError(409, 'agent has tasks or messages and cannot be deleted'); }
-    throw e;
+// Founder: any agent; owner: their own. Never your own founder agent, never the last founder agent.
+// No history -> hard delete. History -> needs ?force=1 and the agent is soft-deleted (history rows stay intact).
+agentsRouter.delete('/agents/:id', async (req, res) => {
+  const force = ['1', 'true'].includes(String(req.query.force ?? ''));
+  const a = await manageableAgent(req);
+  if (req.actor.kind !== 'user') throw new HttpError(403, 'agent tokens cannot use this endpoint');
+  if (a.role === 'founder') {
+    if (a.user_id === req.actor.userId) throw new HttpError(400, "the founder's own agent cannot be deleted");
+    const others = await q1(`select count(*)::int as n from agents where role = 'founder' and deleted_at is null and id <> $1`, [a.id]);
+    if (!others!.n) throw new HttpError(400, 'the last founder agent cannot be deleted');
   }
+  const h = await q1(
+    `select (select count(*)::int from tasks where $1 in (sender_agent_id, assignee_agent_id, reply_to_agent_id)) as tasks,
+            (select count(*)::int from messages where $1 in (sender_agent_id, recipient_agent_id)) as messages,
+            (select count(*)::int from reports where agent_id = $1) as reports`, [a.id]);
+  if (!h!.tasks && !h!.messages && !h!.reports) {
+    stopAgent(a.id);
+    await pool.query('delete from agents where id = $1', [a.id]);
+    await removeAgent(a.id);
+    await audit(pool, req.actor, 'agent.delete', 'agent', a.id, { name: a.name });
+    emitAgentRemoved(a.id);
+    return void res.status(204).end();
+  }
+  if (!force) {
+    throw new HttpError(409, `agent has history (${h!.tasks} task(s), ${h!.messages} message(s)); pass ?force=1 to remove it (history is kept, open tasks are cancelled)`);
+  }
+  stopAgent(a.id);
+  const cancelled = await tx(async (c, after) => {
+    await q(`update agents set deleted_at = now(), token_hash = 'revoked:' || id::text, status = 'OFFLINE', current_task_id = null, current_activity = null
+             where id = $1`, [a.id], c);
+    const open = await q(`select id, status from tasks where assignee_agent_id = $1 and status not in ('COMPLETED','CANCELLED','FAILED') for update`, [a.id], c);
+    const rows: any[] = [];
+    for (const t of open) {
+      rows.push(await q1(`update tasks set status = 'CANCELLED', updated_at = now(), completed_at = null where id = $1 returning *`, [t.id], c));
+      await audit(c, req.actor, 'task.status', 'task', t.id, { from: t.status, to: 'CANCELLED', note: 'Agent removed' });
+    }
+    await audit(c, req.actor, 'agent.delete', 'agent', a.id, { name: a.name, soft: true, tasks: h!.tasks, messages: h!.messages, cancelled_tasks: rows.length });
+    after(() => rows.forEach((t) => emitTask('task:updated', t)));
+    return rows.length;
+  });
   await removeAgent(a.id);
-  await audit(pool, req.actor, 'agent.delete', 'agent', a.id, {});
-  res.status(204).end();
+  emitAgentRemoved(a.id);
+  res.json({ id: a.id, removed: true, soft: true, cancelled_tasks: cancelled });
 });
 
 // ---- "Login with Claude" (per agent; the worker drives the CLI, the server only relays URL/code/status) ----
 const loginView = (r: any) => r && ({ login_id: r.login_id, status: r.status, url: r.url ?? undefined, error: r.error ?? undefined, updated_at: r.updated_at });
 
 async function manageableAgent(req: any) {
-  const agent = await q1('select id, user_id from agents where id = $1', [req.params.id]);
+  const agent = await q1('select id, user_id, name, role from agents where id = $1 and deleted_at is null', [req.params.id]);
   if (!agent || (req.actor.role !== 'founder' && agent.user_id !== req.actor.userId)) throw new HttpError(404, 'agent not found'); // 404: do not reveal other agents
   return agent;
 }
@@ -178,7 +221,7 @@ agentApi.post('/agent/heartbeat', async (req, res) => {
 });
 
 agentApi.get('/agent/peers/:id', async (req, res) => {
-  const p = await q1('select id, role from agents where id = $1', [req.params.id]);
+  const p = await q1('select id, role from agents where id = $1 and deleted_at is null', [req.params.id]);
   if (!p) throw new HttpError(404, 'agent not found');
   res.json(p);
 });
