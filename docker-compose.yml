@@ -1,0 +1,97 @@
+# Backend stack: postgres + backend (API + in-process agents) + pgbackup + nginx reverse proxy.
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  logging: { driver: json-file, options: { max-size: "10m", max-file: "5" } }
+
+services:
+  postgres:
+    <<: *hardening
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: studio
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: studio
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U studio -d studio"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  pgbackup:
+    <<: *hardening
+    image: postgres:17-alpine
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      PGHOST: postgres
+      PGUSER: studio
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: studio
+    volumes:
+      - pgbackups:/backups
+    entrypoint: ["/bin/sh", "-c"]
+    # Daily custom-format dump, 7 days kept. Restore: see README.
+    command:
+      - |
+        while true; do
+          pg_dump -Fc -f /backups/studio-$$(date +%Y%m%d-%H%M).dump && find /backups -name '*.dump' -mtime +7 -delete
+          sleep 86400
+        done
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  backend:
+    <<: *hardening
+    build: .
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 3000
+      DATABASE_URL: postgres://studio:${POSTGRES_PASSWORD}@postgres:5432/studio
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (openssl rand -hex 32)}
+      CONNECTOR_KEY: ${CONNECTOR_KEY:?set CONNECTOR_KEY in .env (openssl rand -hex 32)}
+      TRUST_PROXY: "1"
+      LOG_DIR: /var/log/studio
+      DATA_DIR: /data
+      DEFAULT_FOUNDER_PASSWORD: ${DEFAULT_FOUNDER_PASSWORD:-visitca}
+    volumes:
+      - agentdata:/data   # per-agent Claude logins (/data/claude/<agent_id>) and working copies
+      - logs:/var/log/studio
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+
+  nginx:
+    <<: *hardening
+    image: nginx:1.27-alpine
+    depends_on:
+      backend: { condition: service_healthy }
+    ports:
+      - "80:80"
+      # - "443:443"   # enable together with the TLS server block in deploy/nginx.conf
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./frontend-dist:/usr/share/nginx/html:ro   # optional built frontend (create the dir, may be empty)
+      # - ./certbot/www:/var/www/certbot:ro
+      # - /etc/letsencrypt:/etc/letsencrypt:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:
+  pgbackups:
+  agentdata:
+  logs:
