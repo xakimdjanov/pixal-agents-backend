@@ -93,6 +93,33 @@ describe('in-process agent runners (MOCK_CLAUDE=1)', () => {
     assert.doesNotMatch(ans.payload.text, /No project status data/);
   });
 
+  it('peer QUESTIONs are always answered: founder with no project ids, and a non-member, never the canned refusal', async () => {
+    const pg = (await import('pg')).default;
+    const { insertMessage } = await import('../src/services/messages.js');
+    const db = new pg.Pool({ connectionString: DB });
+    try {
+      const sender = (await api('GET', '/agents', pmToken)).body;
+      const ask = async (role: string, key: string, payload: object) => {
+        const { msg } = await insertMessage(db as any, { type: 'QUESTION', sender: sender.find((a: any) => a.role === role).id, recipient: ids.developer, task_id: null, payload: { asker_project_ids: [], ...payload }, idempotency_key: key });
+        const id = msg.message_id ?? (msg as any).id;
+        return until(async () => (await api('GET', '/messages?limit=500', pmToken)).body.find((m: any) => m.type === 'ANSWER' && m.payload.answers_message_id === id)
+          ?? (await db.query("select payload from messages where type='ANSWER' and payload->>'answers_message_id' = $1", [id])).rows[0]);
+      };
+      const secret = await db.query("insert into projects (name) values ('Hidden Moonshot') returning id");
+      const f = await ask('founder', 'peer-founder', { text: 'Which connectors do you have?' });
+      assert.doesNotMatch(f.payload.text, /only answer questions about projects/);
+      assert.match(f.payload.text, /Project Visitca/);
+      assert.match(f.payload.text, /My connectors:/);
+      assert.match(f.payload.text, /Hidden Moonshot/, 'founder sees every project');
+      const n = await ask('pm', 'peer-nonmember', { text: 'What is the status of Hidden Moonshot? And who are you?' });
+      assert.doesNotMatch(n.payload.text, /only answer questions about projects/);
+      assert.match(n.payload.text, /I can't share details of Hidden Moonshot because you're not a member of it/);
+      assert.match(n.payload.text, /developer agent/);
+      assert.doesNotMatch(n.payload.text, /Project Visitca/, 'no data of projects outside the asker');
+      void secret;
+    } finally { await db.end(); }
+  });
+
   it('answers a QUESTION to the caller\'s OWN agent exactly once, without looping, visible in /messages', async () => {
     const body = { type: 'QUESTION', recipient_agent_id: ids.pm, payload: { text: 'How are things?' }, idempotency_key: 'q-self' };
     const q = await api('POST', '/messages', pmToken, body);
