@@ -9,7 +9,7 @@ export const REPO_URL_RE = /^(https:\/\/|ssh:\/\/)[A-Za-z0-9._~%@:\/+-]+$|^[A-Za
 
 // Thrown when a remote refuses us for lack of (valid) credentials; the runner turns it into a BLOCKED task.
 export class RepoAccessError extends Error {
-  constructor(readonly url: string, readonly hadToken: boolean) {
+  constructor(readonly url: string, readonly hadToken: boolean, readonly detail = '') {
     super(hadToken
       ? `Cannot access repository ${url}: the configured GitHub token was rejected or lacks access. Fix the GitHub connector (Connectors → GitHub token) for this project, then move the task back to PENDING.`
       : `Cannot access repository ${url}: it needs credentials. Add a GitHub connector (Connectors → GitHub token) for this project, then move the task back to PENDING.`);
@@ -51,7 +51,7 @@ const remote = async (agentId: string, cwd: string, args: string[], repoUrl: str
   const auth = token && canAuth(repoUrl) ? { token } : null;
   try { return await git(agentId, cwd, args, auth); }
   catch (e: any) {
-    if (/^https:\/\//.test(repoUrl) && AUTH_FAIL_RE.test(String(e.message))) throw new RepoAccessError(repoUrl, !!auth);
+    if (/^https:\/\//.test(repoUrl) && AUTH_FAIL_RE.test(String(e.message))) throw new RepoAccessError(repoUrl, !!auth, String(e.message));
     throw e;
   }
 };
@@ -93,7 +93,35 @@ export async function commitAll(agentId: string, wt: Worktree, message: string):
 }
 
 const SAFE_NAME = /^(?!\.\.?$)[A-Za-z0-9._-]+$/;
-export interface RepoRef { name: string; dir: string; note?: string }
+export type NoticeReason = 'needs_credentials' | 'not_found' | 'other';
+export interface RepoNotice { kind: 'repo_access'; repo: string; url: string; reason: NoticeReason; message: string }
+export interface RepoRef { name: string; dir: string; note?: string; url?: string; reason?: NoticeReason; message?: string }
+
+export const NOTICE_HINT = 'Add a GitHub connector (Connectors → GitHub token) to read private repositories.';
+
+// Failed clones/fetches are remembered in memory so the same broken remote is not retried on every chat message.
+export const FAILURE_TTL_MS = 10 * 60_000;
+const failures = new Map<string, { at: number; reason: NoticeReason; message: string }>();
+export const clearRepoFailures = () => failures.clear();
+
+const classify = (e: any, hasToken: boolean): { reason: NoticeReason; message: string } => {
+  if (e instanceof RepoAccessError) {
+    if (e.hadToken && /Repository not found/i.test(e.detail)) return { reason: 'not_found', message: 'repository not found, or the GitHub token cannot see it' };
+    return { reason: 'needs_credentials', message: e.hadToken ? 'the GitHub token was rejected or lacks access' : 'needs credentials' };
+  }
+  return { reason: 'other', message: String(e?.message ?? e).slice(0, 120) };
+};
+
+// Deduped by repo: one notice per project/repo, plus a hint when any of them needs credentials.
+export function collectNotices(items: { repo: string; ref: RepoRef }[]): { notices: RepoNotice[]; notice_hint?: string } {
+  const seen = new Map<string, RepoNotice>();
+  for (const { repo, ref } of items) {
+    if (!ref.reason || !ref.url || seen.has(repo)) continue;
+    seen.set(repo, { kind: 'repo_access', repo, url: ref.url, reason: ref.reason, message: ref.message ?? '' });
+  }
+  const notices = [...seen.values()];
+  return notices.length ? { notices, ...(notices.some((n) => n.reason === 'needs_credentials') ? { notice_hint: NOTICE_HINT } : {}) } : { notices };
+}
 
 // Question mode: shared clone(s) (main repo + the project's extra repos), fetched first, never edited.
 // An unreachable remote is not fatal: the answer is based on the last fetched state and says so.
@@ -107,6 +135,14 @@ export async function prepareReadRepos(
   const out: RepoRef[] = [];
   for (const r of wanted) {
     const ref: RepoRef = { name: r.name, dir: r.dir };
+    const fkey = `${agentId}|${r.url}|${r.dir}|${token ? 1 : 0}`;
+    const cached = r.url ? failures.get(fkey) : undefined;
+    const cloned = fs.existsSync(path.join(r.dir, '.git'));
+    if (cached && Date.now() - cached.at < FAILURE_TTL_MS) {
+      Object.assign(ref, { url: r.url, reason: cached.reason, message: cached.message, note: cloned ? `could not fetch (${cached.message}); showing the last fetched state` : `could not be cloned (${cached.message})` });
+      out.push(ref);
+      continue;
+    }
     try {
       if (!fs.existsSync(path.join(r.dir, '.git'))) {
         if (!r.url) { if (r.name !== 'main') continue; fs.mkdirSync(r.dir, { recursive: true }); await git(agentId, r.dir, ['init', '-b', r.branch || 'main']); }
@@ -118,7 +154,11 @@ export async function prepareReadRepos(
       } else if (r.url) {
         await remote(agentId, r.dir, ['fetch', '--all', '--prune'], r.url, token);
       }
+      failures.delete(fkey);
     } catch (e: any) {
+      const c = classify(e, !!token);
+      failures.set(fkey, { at: Date.now(), ...c });
+      Object.assign(ref, { url: r.url, reason: c.reason, message: c.message });
       ref.note = fs.existsSync(path.join(r.dir, '.git')) ? `could not fetch (${String(e.message).slice(0, 120)}); showing the last fetched state` : `could not be cloned (${String(e.message).slice(0, 120)})`;
       if (!fs.existsSync(path.join(r.dir, '.git'))) { out.push(ref); continue; }
     }

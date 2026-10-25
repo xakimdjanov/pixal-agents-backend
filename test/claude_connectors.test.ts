@@ -213,7 +213,12 @@ describe('project repos + chat questions that use git', () => {
     const pmInbox = async () => (await api('GET', '/messages?limit=500', T.pm)).body;
     const ans = await until(async () => (await pmInbox()).find((m: any) => m.type === 'ANSWER' && m.payload.answers_message_id === q.body.message_id));
     assert.match(ans.payload.text, /fix: mobile crash on launch/);
-    assert.match(ans.payload.text, /git-mobile: could not fetch/);
+    assert.doesNotMatch(ans.payload.text, /Note —|could not fetch/); // no prepended note; the failure is structured
+    const n = ans.payload.notices.find((x: any) => x.repo.endsWith('/git-mobile'));
+    assert.equal(n.kind, 'repo_access');
+    assert.equal(n.reason, 'other');
+    assert.equal(n.url, 'https://127.0.0.1:1/git-mobile.git');
+    assert.equal(ans.payload.notice_hint, undefined);
   });
   it('keeps plain status questions on the snapshot path', async () => {
     const q = await api('POST', '/messages', T.pm, { type: 'QUESTION', recipient_agent_id: AID.developer, payload: { text: 'Status?', project_id: projectId }, idempotency_key: 'q-status' });

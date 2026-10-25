@@ -18,7 +18,7 @@ import { allowedToolsFor, checkClaude, listAccountConnectors, runClaude } from '
 import type { Connector } from './connectors.js';
 import { uploadPath } from '../services/attachments.js';
 import { ensureDirs, workDir } from './env.js';
-import { commitAll, prepareReadRepos, prepareWorktree, RepoAccessError } from './git.js';
+import { collectNotices, commitAll, prepareReadRepos, prepareWorktree, RepoAccessError, type RepoRef } from './git.js';
 import { LoginFlow } from './login.js';
 import { studioEligible } from './studioMcp.js';
 import { NO_ATLASSIAN_PROMPT, STYLE_PROMPT } from './prompts.js';
@@ -388,12 +388,14 @@ export class AgentRunner {
     }
     const dirs: { name: string; dir: string }[] = [];
     const notes: string[] = [];
+    const refs: { repo: string; ref: RepoRef }[] = [];
     for (const p of projects) {
       const extras: { name: string; url: string }[] = Array.isArray(p.repos) ? p.repos : [];
       const repos = await prepareReadRepos(this.agentId, p.id, { url: p.repo_url ?? '', branch: p.default_branch ?? 'main' }, extras, await this.loadGitToken(p.id)).catch(() => []);
       for (const r of repos) {
         if (fs.existsSync(path.join(r.dir, '.git'))) dirs.push({ name: `${p.name}/${r.name}`, dir: r.dir });
         if (r.note) notes.push(`${p.name}/${r.name}: ${r.note}`);
+        refs.push({ repo: `${p.name}/${r.name}`, ref: r });
       }
     }
     const studio = studioEligible(this.actor.role);
@@ -415,8 +417,7 @@ export class AgentRunner {
     const r = await runClaude(this.agentId, prompt, dirs[0]?.dir ?? workDir(this.agentId), {
       readOnly: true, memory: !peer, sessionKey: msg.conversation_id, addDirs: [...dirs.slice(1).map((x) => x.dir), ...(att.files.length ? [att.dir] : [])], connectors, accountConnectors: acct, studioActor: studio ? this.actor : undefined, signal: this.abort.signal,
     });
-    const prefix = notes.length ? `Note — ${notes.join('; ')}\n\n` : '';
-    const text = r.ok && r.text ? prefix + r.text : `I could not answer this: ${r.text || 'claude failed'}\n\n${await facts()}`;
-    await this.reply(msg, text, { stale: !r.ok });
+    const text = r.ok && r.text ? r.text : `I could not answer this: ${r.text || 'claude failed'}\n\n${await facts()}`;
+    await this.reply(msg, text, { stale: !r.ok, ...collectNotices(refs) });
   }
 }
