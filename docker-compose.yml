@@ -1,4 +1,4 @@
-# Backend stack: postgres + backend (API + in-process agents) + pgbackup + nginx reverse proxy.
+# Backend stack: postgres + backend (API + in-process agents) + nginx reverse proxy.
 x-hardening: &hardening
   restart: unless-stopped
   security_opt: ["no-new-privileges:true"]
@@ -19,32 +19,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
-
-  pgbackup:
-    <<: *hardening
-    image: postgres:17-alpine
-    depends_on:
-      postgres: { condition: service_healthy }
-    environment:
-      PGHOST: postgres
-      PGUSER: studio
-      PGPASSWORD: ${POSTGRES_PASSWORD}
-      PGDATABASE: studio
-    volumes:
-      - pgbackups:/backups
-    entrypoint: ["/bin/sh", "-c"]
-    # Daily custom-format dump, 7 days kept. Restore: see README.
-    command:
-      - |
-        while true; do
-          pg_dump -Fc -f /backups/studio-$$(date +%Y%m%d-%H%M).dump && find /backups -name '*.dump' -mtime +7 -delete
-          sleep 86400
-        done
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -q"]
-      interval: 30s
-      timeout: 3s
-      retries: 3
 
   backend:
     <<: *hardening
@@ -92,6 +66,5 @@ services:
 
 volumes:
   pgdata:
-  pgbackups:
   agentdata:
   logs:

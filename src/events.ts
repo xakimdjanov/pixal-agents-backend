@@ -31,6 +31,15 @@ export const joinProject = (userId: string, projectId: string) => {
   io?.in(`user:${userId}`).socketsJoin(`project:${projectId}`);
 };
 
+export const leaveProject = (userId: string, projectId: string) => {
+  io?.in(`user:${userId}`).socketsLeave(`project:${projectId}`);
+};
+
+// Membership changed: notify members, founders and (via agent:status listeners) refresh agent lists.
+export const emitProjectUpdated = (projectId: string) => {
+  io?.to(`project:${projectId}`).to('projects:all').emit('project:updated', { project_id: projectId });
+};
+
 export const emitTask = (event: 'task:created' | 'task:updated', task: any) => {
   io?.to(`project:${task.project_id}`).to('projects:all').emit(event, task);
 };

@@ -8,7 +8,7 @@ import { log } from '../log.js';
 import { audit } from '../services/audit.js';
 import { agentSelect } from '../services/agentView.js';
 import { saveClaudeStatus } from '../services/claudeLogin.js';
-import { agentConnectors } from '../services/connectors.js';
+import { agentConnectors, gitTokenFor } from '../services/connectors.js';
 import { insertMessage, publish } from '../services/messages.js';
 import { projectStatus } from '../services/status.js';
 import { changeStatus, submitReport } from '../services/tasks.js';
@@ -18,7 +18,7 @@ import { allowedToolsFor, checkClaude, listAccountConnectors, runClaude } from '
 import type { Connector } from './connectors.js';
 import { uploadPath } from '../services/attachments.js';
 import { ensureDirs, workDir } from './env.js';
-import { commitAll, prepareReadRepos, prepareWorktree } from './git.js';
+import { commitAll, prepareReadRepos, prepareWorktree, RepoAccessError } from './git.js';
 import { LoginFlow } from './login.js';
 import { studioEligible } from './studioMcp.js';
 import { STUDIO_PROMPT } from './studioPrompt.js';
@@ -203,6 +203,7 @@ export class AgentRunner {
     const taskId = msg.task_id as string;
     const task = await q1('select * from tasks where id = $1', [taskId]);
     if (!task) { log('warn', `${this.tag()} task ${taskId} not found`); return; }
+    if (this.currentTask === taskId) { log('info', `${this.tag()} task ${taskId} is already running; ignoring duplicate delivery`); return; }
     if (!rework) {
       if (task.status === 'PENDING') await this.setStatus(taskId, 'ACCEPTED');
       if (['PENDING', 'ACCEPTED'].includes(task.status)) await this.setStatus(taskId, 'IN_PROGRESS');
@@ -215,7 +216,7 @@ export class AgentRunner {
   private async execTask(msg: any, rework: string | null, task: any, taskId: string) {
     const p = msg.payload ?? {};
     try {
-      const wt = await prepareWorktree(this.agentId, task.project_id, taskId, p.repo_url ?? '', p.default_branch ?? 'main');
+      const wt = await prepareWorktree(this.agentId, task.project_id, taskId, p.repo_url ?? '', p.default_branch ?? 'main', await this.loadGitToken(task.project_id));
       const prompt = [
         `You are the ${this.actor.role} agent on project "${p.project_name ?? task.project_id}". Work only inside this git worktree.`,
         `Task: ${task.title}`,
@@ -244,6 +245,8 @@ export class AgentRunner {
         next_steps: [],
       })); // idempotent for a repeated report on a task already in REVIEW
     } catch (e: any) {
+      // Missing/invalid repo credentials are fixable by the user: BLOCKED (not FAILED) so moving it back to PENDING retries.
+      if (e instanceof RepoAccessError) { await this.setStatus(taskId, 'BLOCKED', e.message).catch(() => {}); return; }
       await this.setStatus(taskId, 'FAILED', `agent error: ${String(e.message).slice(0, 500)}`).catch(() => {});
     }
   }
@@ -252,6 +255,11 @@ export class AgentRunner {
   private async loadConnectors(projectId?: string): Promise<Connector[]> {
     try { return (await agentConnectors(this.actor, projectId)) as Connector[]; }
     catch (e: any) { log('warn', `${this.tag()} connector fetch failed: ${e.message}`); return []; }
+  }
+
+  private async loadGitToken(projectId: string): Promise<string | null> {
+    try { return await gitTokenFor(this.actor, projectId); }
+    catch (e: any) { log('warn', `${this.tag()} git token lookup failed: ${e.message}`); return null; }
   }
 
   private async loadAccountConnectors() {
@@ -365,7 +373,7 @@ export class AgentRunner {
     const notes: string[] = [];
     for (const p of projects) {
       const extras: { name: string; url: string }[] = Array.isArray(p.repos) ? p.repos : [];
-      const repos = await prepareReadRepos(this.agentId, p.id, { url: p.repo_url ?? '', branch: p.default_branch ?? 'main' }, extras).catch(() => []);
+      const repos = await prepareReadRepos(this.agentId, p.id, { url: p.repo_url ?? '', branch: p.default_branch ?? 'main' }, extras, await this.loadGitToken(p.id)).catch(() => []);
       for (const r of repos) {
         if (fs.existsSync(path.join(r.dir, '.git'))) dirs.push({ name: `${p.name}/${r.name}`, dir: r.dir });
         if (r.note) notes.push(`${p.name}/${r.name}: ${r.note}`);
@@ -400,7 +408,7 @@ export class AgentRunner {
     const proj = snaps[0]?.project;
     if (!proj) return this.reply(msg, 'I could not load the project, so I cannot answer this.', { stale: true });
     const extras: { name: string; url: string }[] = Array.isArray(proj.repos) ? proj.repos : [];
-    const repos = await prepareReadRepos(this.agentId, projectId, { url: proj.repo_url ?? '', branch: proj.default_branch ?? 'main' }, extras);
+    const repos = await prepareReadRepos(this.agentId, projectId, { url: proj.repo_url ?? '', branch: proj.default_branch ?? 'main' }, extras, await this.loadGitToken(projectId));
     const usable = repos.filter((r) => fs.existsSync(path.join(r.dir, '.git')));
     const connectors = await this.loadConnectors(projectId);
     const acct = await this.loadAccountConnectors();

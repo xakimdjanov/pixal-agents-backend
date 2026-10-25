@@ -10,27 +10,15 @@ import { insertMessage, publish, type MessageType } from './messages.js';
 export const STATUSES = ['PENDING', 'ACCEPTED', 'IN_PROGRESS', 'REVIEW', 'COMPLETED', 'BLOCKED', 'FAILED', 'CANCELLED'] as const;
 export type Status = (typeof STATUSES)[number];
 
-export const TRANSITIONS: Record<Status, Status[]> = {
-  PENDING: ['ACCEPTED', 'CANCELLED'],
-  ACCEPTED: ['IN_PROGRESS', 'BLOCKED', 'FAILED', 'CANCELLED'],
-  IN_PROGRESS: ['REVIEW', 'BLOCKED', 'FAILED', 'CANCELLED'],
-  REVIEW: ['COMPLETED', 'IN_PROGRESS', 'CANCELLED'],
-  BLOCKED: ['IN_PROGRESS', 'FAILED', 'CANCELLED'],
-  FAILED: ['PENDING', 'CANCELLED'],
-  COMPLETED: [],
-  CANCELLED: [],
-};
+// Manual moves (board drag & drop): the reviewer (founder, reply_to agent, creator PM, project PM) may move a task to any status;
+// the assignee only among ASSIGNEE_MOVES. Agent-token assignees (the server-hosted runner) may also report FAILED.
+const ASSIGNEE_MOVES: Status[] = ['ACCEPTED', 'IN_PROGRESS', 'REVIEW', 'BLOCKED'];
 
-// Who may request a transition. REVIEW is reached only through POST /tasks/:id/report.
-function permitted(task: any, actor: Actor, to: Status): boolean {
-  const isAssignee = actor.agentId === task.assignee_agent_id;
-  const isReviewer = actor.role === 'founder' || actor.agentId === task.reply_to_agent_id;
-  if (to === 'REVIEW') return false;
-  if (isAssignee && ['ACCEPTED', 'BLOCKED', 'FAILED'].includes(to)) return true;
-  if (isAssignee && to === 'IN_PROGRESS' && task.status !== 'REVIEW') return true;
-  if (isReviewer && ['COMPLETED', 'CANCELLED', 'PENDING'].includes(to)) return true;
-  if (isReviewer && to === 'IN_PROGRESS' && task.status === 'REVIEW') return true;
-  return false;
+async function isReviewer(c: PoolClient, task: any, actor: Actor): Promise<boolean> {
+  if (actor.role === 'founder' || (actor.agentId && actor.agentId === task.reply_to_agent_id)) return true;
+  if (actor.role !== 'pm') return false;
+  if (task.created_by_user_id === actor.userId) return true;
+  return !!(await q1('select 1 from project_members where project_id = $1 and user_id = $2', [task.project_id, actor.userId], c));
 }
 
 // The founder agent that started this chain of work: walk up parent_task_id to the root task and use its
@@ -50,45 +38,67 @@ export async function founderAgentId(c: PoolClient, task?: any): Promise<string 
   return (await q1(`select id from agents where role = 'founder' order by created_at limit 1`, [], c))?.id ?? null;
 }
 
+// Full TASK_ASSIGNMENT payload (what the runner needs to start work), shared by task creation and manual re-queues.
+async function assignmentPayload(c: PoolClient, row: any) {
+  const proj = await q1('select name, repo_url, default_branch, repos from projects where id = $1', [row.project_id], c);
+  return {
+    title: row.title, description: row.description, acceptance_criteria: row.acceptance_criteria, priority: row.priority,
+    project_id: row.project_id, project_name: proj?.name, repo_url: proj?.repo_url, default_branch: proj?.default_branch, repos: proj?.repos ?? [],
+    parent_task_id: row.parent_task_id,
+  };
+}
+
 export async function changeStatus(c: PoolClient, after: (cb: () => void) => void, taskId: string, actor: Actor, to: Status, note?: string) {
   const task = await q1('select * from tasks where id = $1 for update', [taskId], c);
   if (!task) throw new HttpError(404, 'task not found');
-  if (!TRANSITIONS[task.status as Status].includes(to)) throw new HttpError(409, `invalid transition ${task.status} -> ${to}`);
-  if (!permitted(task, actor, to)) throw new HttpError(403, 'not allowed to make this transition');
-
+  const reviewer = await isReviewer(c, task, actor);
+  const assignee = !!actor.agentId && actor.agentId === task.assignee_agent_id;
+  if (!reviewer && !(assignee && (ASSIGNEE_MOVES.includes(to) || (to === 'FAILED' && actor.kind === 'agent')))) {
+    throw new HttpError(403, 'not allowed to make this transition');
+  }
   const from = task.status as Status;
+  if (from === to) return task;
   const updated = await q1(
     `update tasks set status = $2, updated_at = now(),
        started_at = case when $2 = 'IN_PROGRESS' then coalesce(started_at, now()) else started_at end,
-       completed_at = case when $2 = 'COMPLETED' then now() else completed_at end
+       completed_at = case when $2 = 'COMPLETED' then now() else null end
      where id = $1 returning *`,
     [taskId, to],
     c,
   );
   await audit(c, actor, 'task.status', 'task', taskId, { from, to, note: note ?? null });
 
-  const me = actor.agentId!;
+  const me = actor.agentId ?? task.reply_to_agent_id;
   const other = me === task.assignee_agent_id ? task.reply_to_agent_id : task.assignee_agent_id;
   const base = { task_id: taskId, payload: { status: to, from, note: note ?? null, title: task.title } };
-  const out: { type: MessageType; to: string; extra?: object }[] = [];
-  if (to === 'ACCEPTED') out.push({ type: 'TASK_ACCEPTED', to: task.reply_to_agent_id });
+  const out: { type: MessageType; to: string; extra?: object; key?: string }[] = [];
+  // Re-queue for the assignee, deduped by task + attempt (attempt = TASK_ASSIGNMENTs already sent; the row lock serialises this).
+  const requeue = async () => {
+    const n = Number((await q1(`select count(*)::int as n from messages where task_id = $1 and type = 'TASK_ASSIGNMENT'`, [taskId], c))!.n);
+    out.push({ type: 'TASK_ASSIGNMENT', to: task.assignee_agent_id, extra: await assignmentPayload(c, task), key: `task-assign:${taskId}:${n}` });
+  };
+  if (to === 'ACCEPTED') {
+    out.push({ type: 'TASK_ACCEPTED', to: task.reply_to_agent_id });
+    if (!assignee) await requeue(); // a reviewer/founder moved it: the assignee's runner must pick it up
+  }
   else if (to === 'BLOCKED') out.push({ type: 'BLOCKER', to: task.reply_to_agent_id });
-  else if (to === 'IN_PROGRESS' && from === 'REVIEW') out.push({ type: 'REJECTION', to: task.assignee_agent_id });
-  else if (to === 'PENDING') out.push({ type: 'TASK_ASSIGNMENT', to: task.assignee_agent_id });
+  else if (to === 'IN_PROGRESS' && from === 'REVIEW' && reviewer) out.push({ type: 'REJECTION', to: task.assignee_agent_id });
+  else if (to === 'PENDING') await requeue();
   else if (to === 'COMPLETED') {
     out.push({ type: 'APPROVAL', to: task.assignee_agent_id });
-    // PM approval is escalated to the founder as a report
-    const fid = actor.role === 'pm' ? await founderAgentId(c, task) : null;
+    // A non-founder reviewer's approval is escalated to the founder as a report, once, and only if a report exists
+    const fid = actor.role !== 'founder' ? await founderAgentId(c, task) : null;
     if (fid && fid !== me) {
       const report = await q1('select * from reports where task_id = $1 order by created_at desc limit 1', [taskId], c);
-      out.push({ type: 'TASK_REPORT', to: fid, extra: { approved_by: me, report: report ?? null } });
+      const sent = await q1(`select 1 from messages where task_id = $1 and type = 'TASK_REPORT' and recipient_agent_id = $2 and payload ? 'approved_by'`, [taskId, fid], c);
+      if (report && !sent) out.push({ type: 'TASK_REPORT', to: fid, extra: { approved_by: me, report } });
     }
   } else out.push({ type: 'STATUS_UPDATE', to: other });
 
   const msgs: any[] = [];
   for (const o of out) {
     if (o.to === me && o.type !== 'TASK_REPORT') continue;
-    const { msg } = await insertMessage(c, { ...base, type: o.type, sender: me, recipient: o.to, payload: { ...base.payload, ...o.extra } });
+    const { msg } = await insertMessage(c, { ...base, type: o.type, sender: me, recipient: o.to, idempotency_key: o.key, payload: { ...base.payload, ...o.extra } });
     msgs.push(msg);
   }
   after(() => { emitTask('task:updated', updated); publish(msgs); });
@@ -169,15 +179,10 @@ export async function createTask(a: Actor, b: CreateTaskInput, key: string | nul
       c,
     );
     if (!row) return { task: await q1('select * from tasks where created_by_user_id = $1 and idempotency_key = $2', [a.userId, key], c), created: false };
-    const proj = await q1('select name, repo_url, default_branch, repos from projects where id = $1', [b.project_id], c);
     const { msg } = await insertMessage(c, {
       type: 'TASK_ASSIGNMENT', sender: a.agentId!, recipient: b.assignee_agent_id, task_id: row.id,
       idempotency_key: `task-assign:${row.id}`,
-      payload: {
-        title: row.title, description: row.description, acceptance_criteria: row.acceptance_criteria, priority: row.priority,
-        project_id: row.project_id, project_name: proj?.name, repo_url: proj?.repo_url, default_branch: proj?.default_branch, repos: proj?.repos ?? [],
-        parent_task_id: row.parent_task_id,
-      },
+      payload: await assignmentPayload(c, row),
     });
     await audit(c, a, 'task.create', 'task', row.id, { assignee: b.assignee_agent_id, title: b.title });
     after(() => { emitTask('task:created', row); publish([msg]); });

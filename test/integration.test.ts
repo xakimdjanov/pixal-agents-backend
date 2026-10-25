@@ -106,14 +106,51 @@ describe('studio server', () => {
   });
 
   it('enforces the status state machine and RBAC', async () => {
-    assert.equal((await api('POST', `/agent/tasks/${taskId}/status`, AG.developer, { status: 'COMPLETED' })).status, 409);
-    assert.equal((await api('POST', `/agent/tasks/${taskId}/status`, AG.developer, { status: 'REVIEW' })).status, 409);
+    assert.equal((await api('POST', `/agent/tasks/${taskId}/status`, AG.developer, { status: 'COMPLETED' })).status, 403);
+    assert.equal((await api('POST', `/agent/tasks/${taskId}/status`, AG.developer, { status: 'PENDING' })).status, 403);
     assert.equal((await api('POST', `/agent/tasks/${taskId}/status`, AG.developer, { status: 'ACCEPTED' })).status, 200);
     assert.equal((await api('POST', `/agent/tasks/${taskId}/status`, AG.developer, { status: 'IN_PROGRESS' })).status, 200);
     const accepted = await api('GET', '/agent/inbox', AG.pm);
     assert.ok(accepted.body.some((m: any) => m.type === 'TASK_ACCEPTED'));
     assert.equal((await api('POST', '/tasks', T.developer, {})).status, 403);
     assert.equal((await api('PATCH', `/tasks/${taskId}/status`, T.developer, { status: 'CANCELLED' })).status, 403);
+  });
+
+  it('manual status moves: reviewer any->any, assignee limited, others rejected', async () => {
+    const mk = async () => (await api('POST', '/tasks', T.pm, { project_id: projectId, title: 'move me', assignee_agent_id: AID.developer })).body.id;
+    const id = await mk();
+    const mv = (tok: string, status: string) => api('PATCH', `/tasks/${id}/status`, tok, { status });
+    for (const st of ['REVIEW', 'ACCEPTED', 'IN_PROGRESS', 'BLOCKED']) assert.equal((await mv(T.developer, st)).status, 200, `dev ${st}`);
+    for (const st of ['COMPLETED', 'CANCELLED', 'PENDING', 'FAILED']) assert.equal((await mv(T.developer, st)).status, 403, `dev ${st}`);
+    const t1 = (await mv(T.pm, 'COMPLETED')).body; // no report: allowed, no TASK_REPORT to founder
+    assert.equal(t1.status, 'COMPLETED');
+    assert.ok(t1.completed_at && t1.started_at);
+    assert.equal((await api('GET', '/agent/inbox', AG.founder)).body.filter((m: any) => m.payload?.title === 'move me').length, 0);
+    assert.equal((await mv(T.developer, 'IN_PROGRESS')).status, 200, 'assignee may move own task out of COMPLETED among allowed');
+    assert.equal((await api('GET', `/tasks/${id}`, T.pm)).body.task.completed_at, null);
+    for (const st of ['PENDING', 'FAILED', 'CANCELLED', 'REVIEW', 'COMPLETED', 'ACCEPTED']) assert.equal((await mv(T.founder, st)).status, 200, `founder ${st}`);
+    assert.equal((await mv(T.founder, 'ACCEPTED')).status, 200, 'no-op');
+    assert.equal((await mv(T.pm, 'CANCELLED')).status, 200);
+    assert.equal((await mv(T.pm, 'PENDING')).status, 200);
+    const audits = await api('GET', '/audit', T.founder);
+    assert.ok(audits.body.some((a: any) => a.action === 'task.status' && a.meta?.from && a.meta?.to));
+  });
+
+  it('re-queues a task for its assignee when moved to PENDING/ACCEPTED (full payload, deduped per attempt)', async () => {
+    const id = (await api('POST', '/tasks', T.pm, { project_id: projectId, title: 'requeue me', assignee_agent_id: AID.developer })).body.id;
+    const count = async () => (await api('GET', '/agent/inbox', AG.developer)).body.filter((m: any) => m.task_id === id && m.type === 'TASK_ASSIGNMENT');
+    assert.equal((await count()).length, 1);
+    assert.equal((await api('PATCH', `/tasks/${id}/status`, T.founder, { status: 'BLOCKED' })).status, 200);
+    assert.equal((await api('PATCH', `/tasks/${id}/status`, T.pm, { status: 'PENDING' })).status, 200);
+    assert.equal((await api('PATCH', `/tasks/${id}/status`, T.pm, { status: 'PENDING' })).status, 200, 'no-op repeat');
+    let msgs = await count();
+    assert.equal(msgs.length, 2);
+    assert.ok('repo_url' in msgs[1].payload && msgs[1].payload.project_id === projectId && msgs[1].payload.title === 'requeue me');
+    assert.equal((await api('PATCH', `/tasks/${id}/status`, T.pm, { status: 'ACCEPTED' })).status, 200);
+    assert.equal((await count()).length, 3);
+    assert.equal((await api('PATCH', `/tasks/${id}/status`, T.developer, { status: 'IN_PROGRESS' })).status, 200);
+    assert.equal((await api('PATCH', `/tasks/${id}/status`, T.developer, { status: 'ACCEPTED' })).status, 200);
+    assert.equal((await count()).length, 3, 'assignee own move does not re-queue');
   });
 
   it('delivers a developer report to the PM (reply_to), and PM approval reaches the founder', async () => {
@@ -138,7 +175,8 @@ describe('studio server', () => {
     assert.ok(fr, 'founder receives TASK_REPORT after PM approval');
     assert.equal(fr.payload.report.git_commit, 'abc123');
     assert.ok((await api('GET', '/agent/inbox', AG.developer)).body.some((m: any) => m.type === 'APPROVAL'));
-    assert.equal((await api('PATCH', `/tasks/${taskId}/status`, T.pm, { status: 'IN_PROGRESS' })).status, 409);
+    assert.equal((await api('PATCH', `/tasks/${taskId}/status`, T.pm, { status: 'COMPLETED' })).status, 200, 'same status is a no-op');
+    assert.equal((await api('GET', '/agent/inbox', AG.founder)).body.filter((m: any) => m.type === 'TASK_REPORT').length, 1, 'report sent once');
 
     const detail = await api('GET', `/tasks/${taskId}`, T.pm);
     assert.equal(detail.body.reports.length, 1);
@@ -235,5 +273,30 @@ describe('studio server', () => {
     assert.ok(inbox.body.some((m: any) => m.task_id === t.body.id && m.type === 'TASK_ASSIGNMENT'));
     const again = await api('POST', '/tasks', T.pm, { project_id: projectId, title: 'Survives restart', assignee_agent_id: AID.developer }, { 'Idempotency-Key': 'k-restart' });
     assert.equal(again.body.id, t.body.id, 'idempotency survives restart');
+  });
+  it('manages project members: create with members, list, guarded removal', async () => {
+    const users = (await api('GET', '/users', T.founder)).body;
+    const dev = users.find((u: any) => u.email === 'dev@studio.local');
+    const founder = users.find((u: any) => u.email === 'founder@studio.local');
+    const none = '00000000-0000-0000-0000-000000000000';
+    assert.equal((await api('POST', '/projects', T.founder, { name: 'bad', member_user_ids: [none] })).status, 404);
+    const pm = users.find((u: any) => u.email === 'pm@studio.local');
+    const p = await api('POST', '/projects', T.founder, { name: 'Members', member_user_ids: [dev.id, dev.id, pm.id] });
+    assert.equal(p.status, 201);
+    assert.deepEqual([...p.body.member_user_ids].sort(), [dev.id, pm.id, founder.id].sort());
+    const list = (await api('GET', '/projects', T.founder)).body.find((x: any) => x.id === p.body.id);
+    assert.equal(list.member_count, 3);
+    const members = (await api('GET', `/projects/${p.body.id}/members`, T.founder)).body;
+    const m = members.find((x: any) => x.user_id === dev.id);
+    assert.ok(m.agent_id && m.email && m.role === 'developer');
+    assert.equal((await api('POST', `/projects/${p.body.id}/members`, T.founder, { user_id: dev.id })).status, 201); // idempotent
+    const t = await api('POST', '/tasks', T.pm, { project_id: p.body.id, title: 'Open work', assignee_agent_id: m.agent_id });
+    assert.equal(t.status, 201);
+    const base = `/projects/${p.body.id}/members`;
+    assert.equal((await api('DELETE', `${base}/${founder.id}`, T.founder)).status, 400);
+    assert.equal((await api('DELETE', `${base}/${dev.id}`, T.pm)).status, 403);
+    assert.equal((await api('DELETE', `${base}/${dev.id}`, T.founder)).status, 409);
+    assert.equal((await api('DELETE', `${base}/${dev.id}?force=1`, T.founder)).status, 204);
+    assert.equal((await api('DELETE', `${base}/${dev.id}`, T.founder)).status, 404);
   });
 });

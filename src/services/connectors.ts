@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { config } from '../config.js';
 import type { Actor } from '../auth.js';
-import { pool, q } from '../db.js';
+import { pool, q, q1 } from '../db.js';
 import { HttpError } from '../errors.js';
 import { audit } from './audit.js';
 import { decryptJson } from './crypto.js';
@@ -11,7 +11,7 @@ const strMap = z.record(z.string().max(2000)).default({});
 
 export const configSchemas = {
   jira: z.object({ site_url: https, email: z.string().email().max(200), api_token: z.string().min(1).max(2000), mcp_url: https.optional() }),
-  github: z.object({ token: z.string().min(1).max(2000) }),
+  github: z.object({ token: z.string().min(1).max(2000), git_token: z.string().min(1).max(2000).optional() }),
   mcp: z.object({
     url: z.string().url().max(1000).optional(),
     command: z.string().min(1).max(500).optional(),
@@ -34,7 +34,7 @@ const maskMap = (m: Record<string, string>) => Object.fromEntries(Object.entries
 // Secrets never leave the server in cleartext after creation.
 export function maskConfig(type: ConnectorType, c: Record<string, any>) {
   if (type === 'jira') return { ...c, api_token: mask(c.api_token), ...(c.mcp_url ? { mcp_url: maskUrl(c.mcp_url) } : {}) };
-  if (type === 'github') return { ...c, token: mask(c.token) };
+  if (type === 'github') return { ...c, token: mask(c.token), ...(c.git_token ? { git_token: mask(c.git_token) } : {}) };
   return { ...c, ...(c.url ? { url: maskUrl(c.url) } : {}), headers: maskMap(c.headers ?? {}), env: maskMap(c.env ?? {}) };
 }
 
@@ -120,4 +120,21 @@ export async function agentConnectors(actor: Actor, projectId?: string) {
   }));
   await audit(pool, actor, 'connector.agent_fetch', 'agent', actor.agentId, { count: out.length, project_id: projectId ?? null });
   return out;
+}
+
+// Token for git clone/fetch over https: `git_token` if set, else `token`, from an enabled github connector of the project
+// (preferred) or a global one. Decrypted server-side only, audited via agentConnectors' scope rules, never logged.
+export async function gitTokenFor(actor: Actor, projectId: string): Promise<string | null> {
+  const mine = actor.role === 'founder' || await q1('select 1 from project_members where project_id = $1 and user_id = $2', [projectId, actor.userId]);
+  if (!mine) return null;
+  const rows = await q(
+    `select * from connectors where enabled and type = 'github' and (project_id is null or project_id = $1) order by (project_id is null), created_at`,
+    [projectId],
+  );
+  for (const r of rows) {
+    const c = decryptConfig(r);
+    const t = c.git_token || c.token;
+    if (t) { await audit(pool, actor, 'connector.git_token_fetch', 'agent', actor.agentId, { project_id: projectId }); return String(t); }
+  }
+  return null;
 }
