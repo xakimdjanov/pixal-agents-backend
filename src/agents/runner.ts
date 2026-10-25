@@ -21,6 +21,7 @@ import { ensureDirs, workDir } from './env.js';
 import { commitAll, prepareReadRepos, prepareWorktree, RepoAccessError } from './git.js';
 import { LoginFlow } from './login.js';
 import { studioEligible } from './studioMcp.js';
+import { NO_ATLASSIAN_PROMPT, STYLE_PROMPT } from './prompts.js';
 import { STUDIO_PROMPT } from './studioPrompt.js';
 
 // One in-process "Agent Bridge" per agent: reads its inbox straight from the DB, does the work with the
@@ -275,10 +276,11 @@ export class AgentRunner {
   // Studio connectors + the human's claude.ai account connectors, with the rule for write actions.
   private connectorPrompt(connectors: Connector[], acct: { name: string; status: string; tool_prefix: string }[], none: string) {
     const ok = acct.filter((c) => c.status === 'connected');
-    if (!connectors.length && !ok.length) return none;
+    if (!connectors.length && !ok.length) return `${none}\n${NO_ATLASSIAN_PROMPT}`;
     return [
       connectors.length ? `Studio connector tools (mcp__<name>__*): ${connectors.map((c) => `${c.name} [${c.type}, ${c.allow_write ? 'write allowed' : 'read-only'}]`).join(', ')}. Creating or changing Jira/GitHub items is allowed only for connectors marked write allowed.` : '',
-      ok.length ? `Connectors from the user's claude.ai account (tools ${ok.map((c) => `${c.tool_prefix}__*`).join(', ')}): ${ok.map((c) => c.name.replace(/^claude\.ai /, '')).join(', ')}. Use them to answer questions. Perform a write action (create/edit/delete/comment/transition) only when the user clearly asked for that exact action in this message, then say exactly what you did; otherwise only read.` : '',
+      ok.length ? `Connectors from the user's claude.ai account (tools ${ok.map((c) => `${c.tool_prefix}__*`).join(', ')}): ${ok.map((c) => c.name.replace(/^claude\.ai /, '')).join(', ')}. Use them to answer questions. Perform a write action (create/edit/delete/comment/transition) only when the user clearly asked for that exact action in this message, then say exactly what you did; otherwise only read. Creating a Jira issue additionally needs an explicit yes from the user in a later message.` : '',
+      ok.some((c) => /atlassian/i.test(c.name)) ? '' : acct.some((c) => /atlassian/i.test(c.name)) ? `The Atlassian connector is not usable (status: ${acct.find((c) => /atlassian/i.test(c.name))!.status}); for Jira questions say so and name the fix in one line: Claude settings → Connectors → Atlassian.` : NO_ATLASSIAN_PROMPT,
     ].filter(Boolean).join('\n');
   }
 
@@ -327,45 +329,12 @@ export class AgentRunner {
     const question = String(msg.payload?.text ?? msg.payload?.question ?? '');
     let projectId = msg.payload?.project_id as string | undefined;
     if (!projectId && msg.task_id) projectId = (await q1('select project_id from tasks where id = $1', [msg.task_id]))?.project_id;
-    // Only projects both the asker (as attached by the server) and this agent belong to.
-    const mine: string[] = (await q(
-      this.actor.role === 'founder' ? 'select id from projects' : 'select project_id as id from project_members where user_id = $1',
-      this.actor.role === 'founder' ? [] : [this.actor.userId],
-    )).map((r) => r.id);
-    if (msg.sender_agent_id === this.agentId) return this.answerSelf(msg, question, projectId, mine, att);
-    // Peer chat. A founder asker may see every project; anyone else only the projects both sides belong to.
-    const askerRole = (await q1('select role from agents where id = $1', [msg.sender_agent_id]))?.role;
-    if (askerRole === 'founder') {
-      const all: string[] = (await q('select id from projects')).map((r) => r.id);
-      return this.answerSelf(msg, question, projectId, all, att, true);
-    }
-    const asker = new Set<string>(Array.isArray(msg.payload?.asker_project_ids) ? msg.payload.asker_project_ids : []);
-    const shared = mine.filter((id) => asker.has(id));
-    const ids = projectId ? shared.filter((id) => id === projectId) : shared;
-    // Nothing shared: still answer (general questions, role, connectors) without any project data.
-    if (!ids.length) return this.answerSelf(msg, question, projectId, shared, att, true);
-    const snaps = await Promise.all(ids.map((id) => projectStatus(id).catch(() => null)));
-    const repoNames = snaps.flatMap((s) => (Array.isArray(s?.project?.repos) ? s!.project!.repos.map((r: any) => String(r.name)) : []));
-    if (needsDeepAnswer(question, repoNames) && !att.files.length) return this.answerDeep(msg, question, ids, snaps);
-    const snap = snaps.length === 1 ? snaps[0] : null;
-    let text: string; let stale: boolean;
-    if (snaps.length > 1) {
-      const parts = snaps.map((s) => describeStatus(s, Date.now(), config.staleAfterMs));
-      text = parts.map((d, i) => `Project ${snaps[i]?.project?.name ?? ids[i]}:\n${d.text}`).join('\n\n');
-      stale = parts.every((d) => d.stale);
-    } else ({ text, stale } = describeStatus(snap, Date.now(), config.staleAfterMs));
-    let answer = text;
-    if (snaps.some(Boolean) && (!config.mockClaude || att.files.length)) {
-      const cs = await checkClaude(this.agentId);
-      if (cs.available && cs.logged_in && !cs.limit_reached) {
-        const base = `Answer the question using ONLY the project data below${att.files.length ? ' and the attached images' : ''}. If the data does not contain the answer, say so. Mention if the data is stale. Never reveal your private memory notes.\n\nQuestion: ${question}\n\nData:\n${text}`;
-        const r = att.files.length
-          ? await runClaude(this.agentId, `${base}\n\n${this.attachmentPrompt(att.files)}`, att.dir, { readOnly: true, sessionKey: msg.conversation_id, signal: this.abort.signal })
-          : await runClaude(this.agentId, base, workDir(this.agentId), { noTools: true, sessionKey: msg.conversation_id, signal: this.abort.signal });
-        if (r.ok && r.text) answer = r.text;
-      }
-    }
-    await this.reply(msg, answer, { data_updated_at: snap?.updated_at ?? null, stale });
+    // Every asker gets full access: all Studio projects, all connectors.
+    const all: string[] = (await q('select id from projects')).map((r) => r.id);
+    // The owner = this agent itself (self-chat / the user in the UI) or another agent of the same user.
+    const asker = await q1('select user_id from agents where id = $1', [msg.sender_agent_id]);
+    const self = msg.sender_agent_id === this.agentId || !!(asker?.user_id && asker.user_id === this.actor.userId);
+    return this.answerSelf(msg, question, projectId, all, att, !self);
   }
 
   private async owner() {
@@ -396,27 +365,19 @@ export class AgentRunner {
     return `I've hit my Claude usage limit for now — please try again later or ask ${owner}.`;
   }
 
-  // Projects the question names (or project_id) that the asker may not see.
-  private async deniedProjects(question: string, projectId: string | undefined, allowed: string[]) {
-    const rows = await q('select id, name from projects');
-    const lower = question.toLowerCase();
-    return rows.filter((r) => !allowed.includes(r.id) && (r.id === projectId || (r.name.length > 2 && lower.includes(String(r.name).toLowerCase())))).map((r) => `I can't share details of ${r.name} because you're not a member of it.`);
-  }
-
-  // The human chatting with their OWN agent (peer=false), or a peer/founder asking this agent (peer=true): the allowed
+  // The human chatting with their OWN agent (peer=false), or a peer/founder asking this agent (peer=true): all
   // projects (or the one named), the connectors visible to this agent, and general questions answered by this agent's
   // own Claude login. Read-only. A peer never gets the agent's private memory.
   private async answerSelf(msg: any, question: string, projectId: string | undefined, mine: string[], att: { dir: string; files: string[] }, peer = false) {
-    if (!peer && projectId && !mine.includes(projectId)) return this.reply(msg, 'You do not have access to that project.', { stale: true });
     const ids = projectId && mine.includes(projectId) ? [projectId] : mine;
-    const denied = peer ? await this.deniedProjects(question, projectId, mine) : [];
     const snaps = await Promise.all(ids.map((id) => projectStatus(id).catch(() => null)));
     const projects: any[] = snaps.flatMap((s) => (s?.project ? [s.project] : []));
     const status = snaps.map((s) => (s?.project ? `Project ${s.project.name}:\n${describeStatus(s, Date.now(), config.staleAfterMs).text}` : '')).filter(Boolean).join('\n\n');
     const connectors = await this.loadConnectors(ids.length === 1 ? ids[0] : undefined);
     const acct = await this.loadAccountConnectors();
-    const facts = async () => [status, await this.agentFacts(ids, connectors, acct), ...denied].filter(Boolean).join('\n\n');
-    if (config.mockClaude && !att.files.length) {
+    const facts = async () => [status, await this.agentFacts(ids, connectors, acct)].filter(Boolean).join('\n\n');
+    const repoNames = projects.flatMap((p) => (Array.isArray(p.repos) ? p.repos.map((r: any) => String(r.name)) : []));
+    if (config.mockClaude && !att.files.length && !(peer && needsDeepAnswer(question, repoNames))) {
       const cs = peer ? await checkClaude(this.agentId) : { available: true, logged_in: true, limit_reached: false };
       const down = peer && (!cs.available || !cs.logged_in || cs.limit_reached) ? `${await this.claudeDown(cs)}\n\n` : '';
       return this.reply(msg, peer ? down + (await facts()) : status || 'You have no projects yet.', { stale: peer ? !!down : !status });
@@ -435,58 +396,27 @@ export class AgentRunner {
         if (r.note) notes.push(`${p.name}/${r.name}: ${r.note}`);
       }
     }
-    const studio = !peer && studioEligible(this.actor.role);
+    const studio = studioEligible(this.actor.role);
     const prompt = [
       peer
-        ? `You are ${await this.agentName()}, the ${this.actor.role} agent, answering a question from another user's agent. This is READ-ONLY for files: never modify files, never commit or push. Only these projects may be discussed: ${projects.map((p) => p.name).join(', ') || 'none'}. Never reveal data of any other project, and never reveal your private memory notes. If the question asks for another project's data, say you can't share it because the asker isn't a member of it, and answer the rest.`
+        ? `You are ${await this.agentName()}, the ${this.actor.role} agent, answering a question from another user's agent. This is READ-ONLY for files: never modify files, never commit or push.`
         : `You are ${await this.agentName()}, the ${this.actor.role} agent, chatting directly with your own user. This is READ-ONLY for files: never modify files, never commit or push.`,
       studio ? STUDIO_PROMPT : '',
+      STYLE_PROMPT,
       `Question: ${question}`,
       this.attachmentPrompt(att.files),
-      status ? `Project status snapshot:\n${status}` : peer ? 'No project data may be shared with this asker.' : 'The user has no projects yet.',
+      status ? `Project status snapshot:\n${status}` : 'There are no Studio projects yet.',
       dirs.length ? `Repositories (project/name: directory):\n${dirs.map((r) => `- ${r.name}: ${r.dir}`).join('\n')}\nUse git log/diff/show/status with --all or origin/<branch> refs to see fetched remote work.` : 'No repository could be accessed.',
       notes.length ? `Access problems:\n${notes.map((n) => `- ${n}`).join('\n')}` : '',
       this.connectorPrompt(connectors, acct, 'No connectors are available.'),
       peer ? '' : `You have a persistent memory file: ${memoryFile(this.agentId)} (loaded into every chat). You may remember durable user preferences and facts. Only when the user explicitly asks you to "remember ...", append a short line to that file (Edit/Write on that single file is the only edit allowed), then confirm it. Otherwise never modify it, and never write secrets into it.`,
-      'General questions may be answered from your own knowledge. For anything about projects, code or tickets, answer only from what you actually read; never invent commits, files or tickets, and say plainly what could not be accessed.',
+      'General questions may be answered from your own knowledge. For anything about projects, code or tickets, answer only from what you actually read or fetched with tools; never invent commits, files or tickets.',
     ].filter(Boolean).join('\n\n');
     const r = await runClaude(this.agentId, prompt, dirs[0]?.dir ?? workDir(this.agentId), {
       readOnly: true, memory: !peer, sessionKey: msg.conversation_id, addDirs: [...dirs.slice(1).map((x) => x.dir), ...(att.files.length ? [att.dir] : [])], connectors, accountConnectors: acct, studioActor: studio ? this.actor : undefined, signal: this.abort.signal,
     });
-    const text = r.ok && r.text ? [r.text, ...denied].join('\n\n') : `I could not answer this: ${r.text || 'claude failed'}\n\n${await facts()}`;
+    const prefix = notes.length ? `Note — ${notes.join('; ')}\n\n` : '';
+    const text = r.ok && r.text ? prefix + r.text : `I could not answer this: ${r.text || 'claude failed'}\n\n${await facts()}`;
     await this.reply(msg, text, { stale: !r.ok });
-  }
-
-  // Questions about code/repos/Jira: run claude read-only in the project's checkout(s) after a git fetch,
-  // plus the connector tools this agent may use. Edits are never allowed here (that is a TASK).
-  private async answerDeep(msg: any, question: string, ids: string[], snaps: any[]) {
-    if (ids.length > 1) return this.reply(msg, 'We share several projects; please say which project you mean (set project_id).', { stale: true });
-    const projectId = ids[0];
-    const proj = snaps[0]?.project;
-    if (!proj) return this.reply(msg, 'I could not load the project, so I cannot answer this.', { stale: true });
-    const extras: { name: string; url: string }[] = Array.isArray(proj.repos) ? proj.repos : [];
-    const repos = await prepareReadRepos(this.agentId, projectId, { url: proj.repo_url ?? '', branch: proj.default_branch ?? 'main' }, extras, await this.loadGitToken(projectId));
-    const usable = repos.filter((r) => fs.existsSync(path.join(r.dir, '.git')));
-    const connectors = await this.loadConnectors(projectId);
-    const acct = await this.loadAccountConnectors();
-    if (!config.mockClaude) {
-      const cs = await checkClaude(this.agentId);
-      if (!cs.available || !cs.logged_in || cs.limit_reached) {
-        return this.reply(msg, `${await this.claudeDown(cs)}\n\n${snaps.map((s) => (s?.project ? describeStatus(s, Date.now(), config.staleAfterMs).text : '')).filter(Boolean).join('\n\n')}`, { stale: true });
-      }
-    }
-    const notes = repos.filter((r) => r.note).map((r) => `- ${r.name}: ${r.note}`);
-    const prompt = [
-      `You are answering a teammate's question about project "${proj.name}". This is READ-ONLY: never modify files, never commit or push.`,
-      `Question: ${question}`,
-      usable.length ? `Repositories (name: directory):\n${usable.map((r) => `- ${r.name}: ${r.dir}`).join('\n')}\nUse git log/diff/show/status with --all or origin/<branch> refs to see fetched remote work.` : 'No repository could be accessed.',
-      notes.length ? `Access problems:\n${notes.join('\n')}` : '',
-      this.connectorPrompt(connectors, acct, 'No connectors are configured for this project.'),
-      'Answer only from what you actually read. Never invent commits, files or tickets. If something could not be accessed or a write is not permitted, say so plainly.',
-    ].filter(Boolean).join('\n\n');
-    const first = usable[0]?.dir ?? workDir(this.agentId);
-    const r = await runClaude(this.agentId, prompt, first, { readOnly: true, addDirs: usable.slice(1).map((x) => x.dir), connectors, accountConnectors: acct, signal: this.abort.signal });
-    const prefix = notes.length ? `Note — ${notes.map((n) => n.slice(2)).join('; ')}\n\n` : '';
-    await this.reply(msg, r.ok && r.text ? prefix + r.text : `I could not answer this: ${r.text || 'claude failed'}`, { stale: !r.ok });
   }
 }

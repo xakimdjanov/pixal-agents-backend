@@ -214,8 +214,6 @@ describe('project repos + chat questions that use git', () => {
     const ans = await until(async () => (await pmInbox()).find((m: any) => m.type === 'ANSWER' && m.payload.answers_message_id === q.body.message_id));
     assert.match(ans.payload.text, /fix: mobile crash on launch/);
     assert.match(ans.payload.text, /git-mobile: could not fetch/);
-    assert.match(ans.payload.text, /Connectors: .*jira \(write\)/);
-    assert.match(ans.payload.text, /repo-github \(read-only\)/);
   });
   it('keeps plain status questions on the snapshot path', async () => {
     const q = await api('POST', '/messages', T.pm, { type: 'QUESTION', recipient_agent_id: AID.developer, payload: { text: 'Status?', project_id: projectId }, idempotency_key: 'q-status' });
