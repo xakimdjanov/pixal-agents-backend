@@ -39,6 +39,7 @@ services:
       LOG_DIR: /var/log/studio
       DATA_DIR: /data
       DEFAULT_FOUNDER_PASSWORD: ${DEFAULT_FOUNDER_PASSWORD:-visitca}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
     volumes:
       - agentdata:/data   # per-agent Claude logins (/data/claude/<agent_id>) and working copies
       - logs:/var/log/studio

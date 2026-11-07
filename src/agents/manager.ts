@@ -9,6 +9,7 @@ import { AgentRunner } from './runner.js';
 const runners = new Map<string, AgentRunner>();
 const starting = new Set<string>();
 let reconciler: NodeJS.Timeout | null = null;
+let unsubscribe: (() => void) | null = null;
 
 export async function startAgent(agentId: string) {
   if (runners.has(agentId) || starting.has(agentId)) return;
@@ -45,7 +46,8 @@ async function reconcile() {
 }
 
 export async function startAgents() {
-  onMessage((m) => runners.get(m.recipient_agent_id)?.notify());
+  unsubscribe?.();
+  unsubscribe = onMessage((m) => runners.get(m.recipient_agent_id)?.notify());
   await reconcile();
   reconciler = setInterval(() => void reconcile().catch((e) => log('warn', `agent reconcile failed: ${e.message}`)), 10_000);
   log('info', `agent runners started: ${runners.size} (data dir ${config.dataDir})`);
@@ -55,6 +57,8 @@ export async function startAgents() {
 export async function stopAgents() {
   if (reconciler) clearInterval(reconciler);
   reconciler = null;
+  unsubscribe?.();
+  unsubscribe = null;
   await Promise.all([...runners.values()].map((r) => r.stop()));
   runners.clear();
 }

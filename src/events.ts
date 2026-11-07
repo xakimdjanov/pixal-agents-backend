@@ -79,12 +79,15 @@ export const emitClaudeLogin = (userId: string, s: { agent_id: string; login_id:
 const redact = (m: any) => (m.payload?.code ? { ...m, payload: { ...m.payload, code: '' } } : m);
 
 // Sockets only push; the message is already durable in the DB and in the recipient's inbox.
-let messageListener: ((m: any) => void) | null = null;
+const messageListeners: ((m: any) => void)[] = [];
 // In-process agent runners subscribe here so they react immediately; they also poll their inbox as a fallback.
-export const onMessage = (fn: (m: any) => void) => { messageListener = fn; };
+export const onMessage = (fn: (m: any) => void) => {
+  messageListeners.push(fn);
+  return () => { const i = messageListeners.indexOf(fn); if (i >= 0) messageListeners.splice(i, 1); };
+};
 
 export function emitMessage(msg: any) {
-  try { messageListener?.(msg); } catch { /* runner errors never break delivery */ }
+  for (const fn of messageListeners) { try { fn(msg); } catch { /* listener errors never break delivery */ } }
   io?.to(`agent:${msg.recipient_agent_id}`).emit('message:new', msg);
   io?.to(`agent:${msg.sender_agent_id}`).to('founders').except(`agent:${msg.recipient_agent_id}`).emit('message:new', redact(msg));
 }

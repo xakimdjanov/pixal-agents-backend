@@ -43,5 +43,7 @@ export const config = {
   claudeStatusMs: Number(env.CLAUDE_STATUS_MS ?? 300_000),
   taskTimeoutMs: Number(env.TASK_TIMEOUT_MS ?? 30 * 60_000),
   staleAfterMs: Number(env.STALE_AFTER_MS ?? 24 * 3_600_000),
+  // Telegram bot (long polling). Empty = bot disabled.
+  telegramToken: env.TELEGRAM_BOT_TOKEN ?? '',
   offlineAfterSec: Number(env.AGENT_OFFLINE_AFTER_SEC ?? 45),
 };

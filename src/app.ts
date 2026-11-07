@@ -15,6 +15,8 @@ import { connectorsRouter } from './routes/connectors.js';
 import { messagesRouter } from './routes/messages.js';
 import { projectsRouter } from './routes/projects.js';
 import { tasksRouter } from './routes/tasks.js';
+import { telegramRouter } from './routes/telegram.js';
+import { startTelegram } from './services/telegram.js';
 import { studioMcpRouter } from './agents/studioMcp.js';
 import { startAgents } from './agents/manager.js';
 import { startQueue } from './services/queue.js';
@@ -52,7 +54,7 @@ export function createServer() {
 
   const api = express.Router();
   api.use(rateLimit({ windowMs: 60_000, limit: config.rateMax, standardHeaders: true, legacyHeaders: false, message: { error: 'rate limit exceeded' } }));
-  api.use(authRouter, projectsRouter, agentsRouter, agentApi, tasksRouter, messagesRouter, auditRouter, connectorsRouter);
+  api.use(authRouter, projectsRouter, agentsRouter, agentApi, tasksRouter, messagesRouter, auditRouter, connectorsRouter, telegramRouter);
   api.use((_req, res) => void res.status(404).json({ error: 'not found' }));
   app.use('/api', api);
   app.use(errorHandler);
@@ -62,6 +64,7 @@ export function createServer() {
   attachSockets(io);
 
   let stopQueue = () => {};
+  let stopTelegram = () => {};
   let stopAgents: () => Promise<void> = async () => {};
   return {
     app,
@@ -69,6 +72,7 @@ export function createServer() {
     start: (port = config.port) =>
       new Promise<number>((resolve) => {
         stopQueue = startQueue();
+        stopTelegram = startTelegram();
         server.listen(port, () => {
           resolve((server.address() as any).port);
           void startAgents().then((stop) => { stopAgents = stop; }).catch((e) => log('error', `agents failed to start: ${e.message}`));
@@ -76,6 +80,7 @@ export function createServer() {
       }),
     stop: async () => {
       stopQueue();
+      stopTelegram();
       await stopAgents();
       closeSockets();
       await new Promise((r) => server.close(r));
