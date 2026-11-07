@@ -8,6 +8,7 @@ import { pool, q, q1, tx } from '../db.js';
 import { onMessage } from '../events.js';
 import { log } from '../log.js';
 import { audit } from './audit.js';
+import { startJiraWatch } from './jiraWatch.js';
 import { insertMessage, publish } from './messages.js';
 
 const LINK_TTL_MS = 10 * 60_000;
@@ -27,7 +28,8 @@ const api = async (method: string, body: object = {}) => {
 const BTN_AGENTS = '🤖 Agentni tanlash';
 const BTN_WHO = 'ℹ️ Holat';
 const BTN_UNLINK = '🔌 Uzish';
-const MENU = { keyboard: [[{ text: BTN_AGENTS }], [{ text: BTN_WHO }, { text: BTN_UNLINK }]], resize_keyboard: true, is_persistent: true };
+const BTN_JIRA = '🔔 Jira xabarlari';
+const MENU = { keyboard: [[{ text: BTN_AGENTS }], [{ text: BTN_JIRA }, { text: BTN_WHO }, { text: BTN_UNLINK }]], resize_keyboard: true, is_persistent: true };
 
 const send = (chatId: number | string, text: string, reply_markup: object = MENU) =>
   api('sendMessage', { chat_id: chatId, text: text.slice(0, 4000), reply_markup }).catch((e) => log('warn', e.message));
@@ -38,6 +40,10 @@ const agentButtons = (agents: any[], selected: string | null) => ({
     callback_data: `sel:${g.id}`,
   }]),
 });
+
+// Plain notification (used by the Jira watcher); HTML is never used, so user text cannot inject markup.
+export const notifyChat = (chatId: number | string, text: string) =>
+  api('sendMessage', { chat_id: chatId, text: text.slice(0, 4000), disable_web_page_preview: true }).catch((e) => log('warn', e.message));
 
 export const telegramEnabled = () => !!config.telegramToken;
 
@@ -141,6 +147,10 @@ async function handle(upd: any) {
     await q('update telegram_links set selected_agent_id = $2 where chat_id = $1', [chatId, g.id]);
     return send(chatId, `Endi savollar "${g.name}" ga boradi.`);
   }
+  if (cmd === '/jira' || text === BTN_JIRA) {
+    const r = await q1('update telegram_links set notify_jira = not notify_jira where chat_id = $1 returning notify_jira', [chatId]);
+    return send(chatId, r?.notify_jira ? '🔔 Jira xabarlari yoqildi: izohlar, status va boshqa o\'zgarishlar shu yerga keladi.' : '🔕 Jira xabarlari o\'chirildi.');
+  }
   if (cmd === '/whoami' || text === BTN_WHO) {
     const sel = agents.find((g) => g.id === (a.selected ?? a.agentId));
     return send(chatId, `👤 ${a.name} (${a.role})\n💬 Savollar: ${sel?.name ?? '—'}`);
@@ -170,6 +180,7 @@ async function forwardAnswer(msg: any) {
 export function startTelegram(): () => void {
   if (!telegramEnabled()) return () => {};
   let stopped = false;
+  const stopJira = startJiraWatch(notifyChat);
   const unsubscribe = onMessage((m) => void forwardAnswer(m).catch((e) => log('warn', `telegram forward failed: ${e.message}`)));
   void (async () => {
     try {
@@ -191,5 +202,5 @@ export function startTelegram(): () => void {
       }
     }
   })();
-  return () => { stopped = true; unsubscribe(); };
+  return () => { stopped = true; unsubscribe(); stopJira(); };
 }
